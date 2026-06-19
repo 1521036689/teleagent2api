@@ -80,19 +80,24 @@ func TransformNonStreamingResponse(body []byte) []byte {
 		resp["choices"] = choicesOut
 	}
 
-	// Clean usage: remove non-standard sub-fields
+	// Clean usage: only keep standard OpenAI fields
 	if usageRaw, ok := resp["usage"]; ok {
 		var usage map[string]json.RawMessage
 		if err := json.Unmarshal(usageRaw, &usage); err == nil {
-			delete(usage, "completion_tokens_details")
-			delete(usage, "prompt_tokens_details")
-			usageOut, _ := json.Marshal(usage)
+			keepUsage := make(map[string]json.RawMessage)
+			for _, k := range []string{"prompt_tokens", "completion_tokens", "total_tokens"} {
+				if v, ok := usage[k]; ok {
+					keepUsage[k] = v
+				}
+			}
+			usageOut, _ := json.Marshal(keepUsage)
 			resp["usage"] = usageOut
 		}
 	}
 
 	// Remove non-standard top-level fields
 	delete(resp, "request_id")
+	delete(resp, "system_fingerprint")
 
 	out, err := json.Marshal(resp)
 	if err != nil {
@@ -240,9 +245,13 @@ func (s *StreamChunkState) TransformChunk(data []byte) ([]byte, bool) {
 	if usageRaw, ok := chunk["usage"]; ok {
 		var usage map[string]json.RawMessage
 		if err := json.Unmarshal(usageRaw, &usage); err == nil {
-			delete(usage, "completion_tokens_details")
-			delete(usage, "prompt_tokens_details")
-			usageOut, _ := json.Marshal(usage)
+			keepUsage := make(map[string]json.RawMessage)
+			for _, k := range []string{"prompt_tokens", "completion_tokens", "total_tokens"} {
+				if v, ok := usage[k]; ok {
+					keepUsage[k] = v
+				}
+			}
+			usageOut, _ := json.Marshal(keepUsage)
 			chunk["usage"] = usageOut
 		}
 	}
