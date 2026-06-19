@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"teleagent2api/internal/adapter"
 	"teleagent2api/internal/config"
 	"teleagent2api/internal/middleware"
 	"teleagent2api/internal/proxy"
@@ -33,13 +34,22 @@ func Models(cfg config.Config) http.HandlerFunc {
 
 		data := make([]map[string]any, 0, len(cfg.Models))
 		for _, m := range cfg.Models {
-			data = append(data, map[string]any{
+			entry := map[string]any{
 				"id":       m,
 				"object":   "model",
 				"created":  modelCreated,
 				"owned_by": "TeleAgent",
 				"name":     m,
-			})
+			}
+			if meta, ok := cfg.ModelMeta[m]; ok {
+				entry["context_length"] = meta.ContextLen
+				entry["max_output_tokens"] = meta.MaxOutput
+				entry["tool_call"] = meta.ToolCall
+				entry["tool_stream"] = meta.ToolStream
+				entry["reasoning"] = meta.Reasoning
+				entry["temperature"] = meta.Temperature
+			}
+			data = append(data, entry)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -50,7 +60,7 @@ func Models(cfg config.Config) http.HandlerFunc {
 	}
 }
 
-func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, retryCount int) http.HandlerFunc {
+func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, retryCount int, modelMeta map[string]config.ModelMeta) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -65,6 +75,10 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, retryCount in
 			http.Error(w, "read body error", http.StatusBadRequest)
 			return
 		}
+
+		// Sanitize request: strip unsupported params that cause upstream errors
+		// and cap max_tokens to model limits
+		body = adapter.SanitizeRequest(body, modelMeta)
 
 		upstreamReq, err := up.BuildRequest(r, body)
 		if err != nil {
@@ -82,7 +96,6 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, retryCount in
 					slog.Int("attempt", attempt),
 					slog.Int("max_retries", retryCount),
 				)
-				// Rebuild request: previous attempt consumed the body context.
 				upstreamReq, err = up.BuildRequest(r, body)
 				if err != nil {
 					slog.ErrorContext(r.Context(), "failed to rebuild upstream request",
@@ -104,7 +117,6 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, retryCount in
 				http.Error(w, "bad gateway", http.StatusBadGateway)
 				return
 			}
-			// Retry on server-side errors (5xx); client errors (4xx) are not retriable.
 			if resp.StatusCode >= 500 && attempt < retryCount {
 				resp.Body.Close()
 				resp = nil
@@ -119,14 +131,105 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, retryCount in
 		)
 
 		copyHeaders(w.Header(), resp.Header)
+
+		// If upstream returned an error (4xx/5xx), pass through as-is
+		if resp.StatusCode >= 400 {
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			return
+		}
+
 		w.WriteHeader(resp.StatusCode)
 
 		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-			flushCopy(w, r, resp.Body)
+			transformFlushCopy(w, r, resp.Body)
 			return
 		}
-		io.Copy(w, resp.Body)
+		transformNonStreamingCopy(w, resp.Body)
 	}
+}
+
+// transformNonStreamingCopy reads the full upstream response, transforms it
+// to be OpenAI-compatible, then writes it out.
+func transformNonStreamingCopy(w http.ResponseWriter, body io.Reader) {
+	raw, err := io.ReadAll(body)
+	if err != nil {
+		slog.Error("failed to read upstream response body", slog.String("error", err.Error()))
+		return
+	}
+	transformed := adapter.TransformNonStreamingResponse(raw)
+	w.Write(transformed)
+}
+
+// transformFlushCopy reads SSE lines from upstream, transforms each data
+// payload to be OpenAI-compatible, and flushes to the client.
+func transformFlushCopy(w http.ResponseWriter, r *http.Request, body io.Reader) {
+	flusher, ok := w.(http.Flusher)
+	reader := bufio.NewReader(body)
+	ctx := r.Context()
+	state := adapter.NewStreamChunkState()
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			transformed, skip := transformSSELine(line, state)
+			if !skip {
+				if _, writeErr := w.Write(transformed); writeErr != nil {
+					slog.WarnContext(ctx, "transformFlushCopy: client disconnected",
+						slog.String("error", writeErr.Error()),
+						slog.String("request_id", middleware.GetRequestID(ctx)),
+					)
+					return
+				}
+				if ok {
+					flusher.Flush()
+				}
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				slog.WarnContext(ctx, "transformFlushCopy: upstream read error",
+					slog.String("error", err.Error()),
+				)
+			}
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			slog.DebugContext(ctx, "transformFlushCopy: context cancelled, stopping copy")
+			return
+		default:
+		}
+	}
+}
+
+// transformSSELine transforms a single SSE line. Only "data: " lines with
+// JSON payloads are transformed; everything else passes through unchanged.
+// Returns (output, skip). If skip is true, this line should be dropped.
+func transformSSELine(line []byte, state *adapter.StreamChunkState) ([]byte, bool) {
+	trimmed := strings.TrimRight(string(line), "\r\n")
+	if !strings.HasPrefix(trimmed, "data: ") {
+		return line, false
+	}
+
+	payload := strings.TrimPrefix(trimmed, "data: ")
+
+	// "data: [DONE]" passes through as-is
+	if payload == "[DONE]" {
+		return line, false
+	}
+
+	transformed, skip := state.TransformChunk([]byte(payload))
+	if skip {
+		return nil, true
+	}
+
+	var sb strings.Builder
+	sb.WriteString("data: ")
+	sb.Write(transformed)
+	sb.WriteString("\n")
+	return []byte(sb.String()), false
 }
 
 // proxyResponseHeaderBlacklist lists upstream headers that should never be
@@ -154,42 +257,4 @@ func copyHeaders(dst, src http.Header) {
 		}
 	}
 	dst.Set("Connection", "close")
-}
-
-func flushCopy(w http.ResponseWriter, r *http.Request, body io.Reader) {
-	flusher, ok := w.(http.Flusher)
-	reader := bufio.NewReader(body)
-	ctx := r.Context()
-
-	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			if _, writeErr := w.Write(line); writeErr != nil {
-				slog.WarnContext(ctx, "flushCopy: client disconnected",
-					slog.String("error", writeErr.Error()),
-					slog.String("request_id", middleware.GetRequestID(ctx)),
-				)
-				return
-			}
-			if ok {
-				flusher.Flush()
-			}
-		}
-		if err != nil {
-			if err != io.EOF {
-				slog.WarnContext(ctx, "flushCopy: upstream read error",
-					slog.String("error", err.Error()),
-				)
-			}
-			return
-		}
-
-		// Respect client disconnect.
-		select {
-		case <-ctx.Done():
-			slog.DebugContext(ctx, "flushCopy: context cancelled, stopping copy")
-			return
-		default:
-		}
-	}
 }

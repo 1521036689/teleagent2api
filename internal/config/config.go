@@ -10,6 +10,18 @@ import (
 	"time"
 )
 
+// ModelMeta holds the capabilities and limits of a single model.
+type ModelMeta struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	ContextLen  int    `json:"context_length"`
+	MaxOutput   int    `json:"max_output_tokens"`
+	ToolCall    bool   `json:"tool_call"`
+	ToolStream  bool   `json:"tool_stream"`
+	Reasoning   bool   `json:"reasoning"`
+	Temperature bool   `json:"temperature"`
+}
+
 type Config struct {
 	Token          string        `json:"-"`
 	DeviceID       string        `json:"deviceId"`
@@ -21,6 +33,7 @@ type Config struct {
 	UserAgent      string        `json:"userAgent,omitempty"`
 	Listen         string        `json:"listen,omitempty"`
 	Models         []string      `json:"models,omitempty"`
+	ModelMeta      map[string]ModelMeta `json:"model_meta,omitempty"`
 	Timeout        time.Duration `json:"timeout,omitempty"`
 	LogLevel       string        `json:"logLevel,omitempty"`
 	LogFormat      string        `json:"logFormat,omitempty"`
@@ -170,6 +183,10 @@ func Load() Config {
 		}
 	}
 
+	if len(c.ModelMeta) == 0 {
+		c.ModelMeta = DefaultModelMeta()
+	}
+
 	return c
 }
 
@@ -221,4 +238,41 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// DefaultModelMeta returns the built-in model metadata discovered from
+// the TeleAgent client's DEFAULT_NEWAPI_MODELS configuration.
+func DefaultModelMeta() map[string]ModelMeta {
+	return map[string]ModelMeta{
+		"chat-lite": {
+			ID:          "chat-lite",
+			Name:        "轻量",
+			ContextLen:  100_000,
+			MaxOutput:   16384,
+			ToolCall:    true,
+			ToolStream:  true,
+			Reasoning:   false,
+			Temperature: true,
+		},
+		"chat-pro": {
+			ID:          "chat-pro",
+			Name:        "旗舰",
+			ContextLen:  192_000,
+			MaxOutput:   65536,
+			ToolCall:    true,
+			ToolStream:  true,
+			Reasoning:   true,
+			Temperature: true,
+		},
+		"chat-flash": {
+			ID:          "chat-flash",
+			Name:        "极速",
+			ContextLen:  192_000,
+			MaxOutput:   65536,
+			ToolCall:    true,
+			ToolStream:  true,
+			Reasoning:   false,
+			Temperature: true,
+		},
+	}
 }
