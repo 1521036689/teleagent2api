@@ -218,6 +218,19 @@ func (s *StreamChunkState) TransformChunk(data []byte) ([]byte, bool) {
 			continue
 		}
 
+			// This chunk has content (possibly empty)
+		var contentStr string
+		if hasContent {
+			_ = json.Unmarshal(delta["content"], &contentStr)
+		}
+
+		// Skip empty content chunks (chat-pro reasoning phase sends these
+		// as incremental usage updates with content:"")
+		if hasContent && contentStr == "" {
+			continue
+		}
+
+		// We have real content now
 		allReasoning = false
 		s.seenContent = true
 
@@ -241,6 +254,9 @@ func (s *StreamChunkState) TransformChunk(data []byte) ([]byte, bool) {
 
 	choicesOut, _ := json.Marshal(choices)
 	chunk["choices"] = choicesOut
+
+	// Remove non-standard top-level fields from streaming chunks
+	delete(chunk, "system_fingerprint")
 
 	if usageRaw, ok := chunk["usage"]; ok {
 		var usage map[string]json.RawMessage
