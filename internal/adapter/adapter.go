@@ -1,7 +1,9 @@
 package adapter
 
 import (
+	"bytes"
 	"encoding/json"
+	"log/slog"
 	"strings"
 
 	"teleagent2api/internal/config"
@@ -20,13 +22,26 @@ var allowedRequestFields = map[string]bool{
 	"tool_choice": true,
 }
 
+// validFinishReasons lists the only finish_reason values allowed by the
+// OpenAI spec. Any other value is replaced with null.
+var validFinishReasons = map[string]bool{
+	"stop":           true,
+	"length":         true,
+	"tool_calls":     true,
+	"content_filter": true,
+}
+
 // SanitizeRequest strips fields that the upstream does not support,
 // preventing "API 调用参数有误" errors from Claude Code requests.
 // It also caps max_tokens to the model's maximum output limit.
 func SanitizeRequest(body []byte, modelMeta map[string]config.ModelMeta) []byte {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return body // not valid JSON, forward as-is
+		slog.Warn("adapter: failed to parse request body, forwarding as-is",
+			slog.String("error", err.Error()),
+			slog.Int("body_len", len(body)),
+		)
+		return body
 	}
 
 	cleaned := make(map[string]json.RawMessage, len(raw))
@@ -44,8 +59,17 @@ func SanitizeRequest(body []byte, modelMeta map[string]config.ModelMeta) []byte 
 			if maxTokensRaw, ok := cleaned["max_tokens"]; ok {
 				var maxTokens int
 				_ = json.Unmarshal(maxTokensRaw, &maxTokens)
-				if maxTokens > meta.MaxOutput {
+				if maxTokens <= 0 || maxTokens > meta.MaxOutput {
 					capped, _ := json.Marshal(meta.MaxOutput)
+					cleaned["max_tokens"] = capped
+				}
+			}
+		} else {
+			if maxTokensRaw, ok := cleaned["max_tokens"]; ok {
+				var maxTokens int
+				_ = json.Unmarshal(maxTokensRaw, &maxTokens)
+				if maxTokens <= 0 || maxTokens > 65536 {
+					capped, _ := json.Marshal(65536)
 					cleaned["max_tokens"] = capped
 				}
 			}
@@ -62,7 +86,7 @@ func SanitizeRequest(body []byte, modelMeta map[string]config.ModelMeta) []byte 
 // TransformNonStreamingResponse rewrites an upstream non-streaming response
 // to be fully OpenAI-compatible. The reasoning embedded as <think>...</think>
 // in the message content is handled according to the configured mode.
-func TransformNonStreamingResponse(body []byte, mode string) []byte {
+func TransformNonStreamingResponse(body []byte, mode string, requestModel string) []byte {
 	var resp map[string]json.RawMessage
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return body
@@ -76,7 +100,10 @@ func TransformNonStreamingResponse(body []byte, mode string) []byte {
 		for i, choice := range choices {
 			choices[i] = transformChoice(choice, mode)
 		}
-		choicesOut, _ := json.Marshal(choices)
+		choicesOut, err := json.Marshal(choices)
+		if err != nil {
+			return body
+		}
 		resp["choices"] = choicesOut
 	}
 
@@ -85,6 +112,12 @@ func TransformNonStreamingResponse(body []byte, mode string) []byte {
 		if cleaned := cleanUsage(usageRaw); cleaned != nil {
 			resp["usage"] = cleaned
 		}
+	}
+
+	// Override the upstream model with the original request model
+	if requestModel != "" {
+		mv, _ := json.Marshal(requestModel)
+		resp["model"] = mv
 	}
 
 	// Remove non-standard top-level fields
@@ -121,10 +154,8 @@ func transformChoice(choice map[string]json.RawMessage, mode string) map[string]
 		reasoning, answer := splitThinkFull(content)
 		switch mode {
 		case "reasoning_content":
-			if answer != "" {
-				cv, _ := json.Marshal(answer)
-				msg["content"] = cv
-			}
+			cv, _ := json.Marshal(answer)
+			msg["content"] = cv
 			if reasoning != "" {
 				rv, _ := json.Marshal(reasoning)
 				msg["reasoning_content"] = rv
@@ -161,6 +192,10 @@ func transformChoice(choice map[string]json.RawMessage, mode string) map[string]
 // IsEmptyResponse returns true if a non-streaming response has no usable
 // content — both content and reasoning_content are empty or missing.
 func IsEmptyResponse(body []byte) bool {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return true
+	}
+
 	var resp map[string]json.RawMessage
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return false
@@ -225,11 +260,14 @@ type segment struct {
 // It is stateful across the chunks of a single response and is NOT safe for
 // concurrent use.
 type StreamProcessor struct {
-	mode       string
-	roleSent   bool
-	inThink    bool
-	pending    string
-	hasContent bool
+	mode         string
+	roleSent     bool
+	inThink      bool
+	pending      string
+	hasContent   bool
+	RequestModel string          // original model name from the client request
+	finished     bool            // true after finish_reason has been sent
+	usage        json.RawMessage // accumulated usage, emitted only in the final chunk
 }
 
 // NewStreamProcessor creates a processor for the given reasoning mode.
@@ -261,14 +299,20 @@ func (p *StreamProcessor) ProcessChunk(data []byte) [][]byte {
 		return [][]byte{data} // unknown payload, pass through
 	}
 
+	reqModel := chunk["model"]
+	if p.RequestModel != "" {
+		mv, _ := json.Marshal(p.RequestModel)
+		reqModel = mv
+	}
 	meta := chunkMeta{
 		id:      chunk["id"],
 		object:  chunk["object"],
 		created: chunk["created"],
-		model:   chunk["model"],
+		model:   reqModel,
 	}
 
 	var contentStr, upstreamReasoning, finish string
+	var toolCalls json.RawMessage
 	haveFinish := false
 
 	if cr, ok := chunk["choices"]; ok {
@@ -284,14 +328,19 @@ func (p *StreamProcessor) ProcessChunk(data []byte) [][]byte {
 					if rv, ok := delta["reasoning_content"]; ok {
 						_ = json.Unmarshal(rv, &upstreamReasoning)
 					}
+					if tc, ok := delta["tool_calls"]; ok {
+						toolCalls = tc
+					}
 				}
 			}
 			if fr, ok := ch["finish_reason"]; ok {
 				var f interface{}
 				if json.Unmarshal(fr, &f) == nil && f != nil {
-					haveFinish = true
-					if s, ok := f.(string); ok {
-						finish = s
+					if s, ok := f.(string); ok && s != "" {
+						if validFinishReasons[s] {
+							haveFinish = true
+							finish = s
+						}
 					}
 				}
 			}
@@ -314,7 +363,11 @@ func (p *StreamProcessor) ProcessChunk(data []byte) [][]byte {
 		if p.mode == "content" {
 			segs = []segment{{segAnswer, contentStr}}
 		} else {
-			segs = p.splitThink(contentStr)
+			content := contentStr
+			if upstreamReasoning != "" {
+				content = stripThinkTags(content)
+			}
+			segs = p.splitThink(content)
 		}
 		for _, seg := range segs {
 			if b := p.emitSegment(meta, seg); b != nil {
@@ -323,13 +376,21 @@ func (p *StreamProcessor) ProcessChunk(data []byte) [][]byte {
 		}
 	}
 
-	// Carry finish_reason and/or usage on a trailing chunk.
-	var usageOut json.RawMessage
-	if ur, ok := chunk["usage"]; ok {
-		usageOut = cleanUsage(ur)
+	// Forward tool_calls if present in the upstream delta.
+	if toolCalls != nil {
+		if b := p.buildToolCall(meta, toolCalls); b != nil {
+			out = append(out, b)
+		}
 	}
-	if haveFinish || usageOut != nil {
-		out = append(out, p.buildTail(meta, finish, haveFinish, usageOut))
+
+	// Accumulate usage; only emit on the final chunk alongside finish_reason.
+	if ur, ok := chunk["usage"]; ok {
+		p.usage = cleanUsage(ur)
+	}
+	if haveFinish {
+		out = append(out, p.buildTail(meta, finish, true, p.usage))
+		p.usage = nil
+		p.finished = true
 	}
 
 	return out
@@ -403,22 +464,30 @@ func (p *StreamProcessor) splitThink(s string) []segment {
 	return segs
 }
 
-// Flush emits any buffered partial text at the end of the stream.
+// Flush emits any buffered partial text and/or accumulated usage at stream end.
 func (p *StreamProcessor) Flush() [][]byte {
-	if p.pending == "" {
-		return nil
+	var out [][]byte
+
+	if p.pending != "" {
+		text := p.pending
+		p.pending = ""
+		kind := segAnswer
+		if p.inThink {
+			kind = segReasoning
+		}
+		meta := chunkMeta{object: json.RawMessage(`"chat.completion.chunk"`)}
+		if b := p.emitSegment(meta, segment{kind, text}); b != nil {
+			out = append(out, b)
+		}
 	}
-	text := p.pending
-	p.pending = ""
-	kind := segAnswer
-	if p.inThink {
-		kind = segReasoning
+
+	// If usage was accumulated but never emitted in a finish chunk, emit it now.
+	if p.usage != nil && !p.finished {
+		meta := chunkMeta{object: json.RawMessage(`"chat.completion.chunk"`)}
+		out = append(out, p.buildTail(meta, "", false, p.usage))
 	}
-	meta := chunkMeta{object: json.RawMessage(`"chat.completion.chunk"`)}
-	if b := p.emitSegment(meta, segment{kind, text}); b != nil {
-		return [][]byte{b}
-	}
-	return nil
+
+	return out
 }
 
 // partialSuffix returns the length of the longest suffix of buf that is a
@@ -461,6 +530,7 @@ func assemble(meta chunkMeta, delta map[string]json.RawMessage, finishRaw string
 	choice := map[string]json.RawMessage{
 		"index":         json.RawMessage(`0`),
 		"delta":         deltaRaw,
+		"logprobs":      json.RawMessage(`null`),
 		"finish_reason": json.RawMessage(finishRaw),
 	}
 	choiceRaw, _ := json.Marshal(choice)
@@ -489,6 +559,20 @@ func assemble(meta chunkMeta, delta map[string]json.RawMessage, finishRaw string
 	return raw
 }
 
+// buildToolCall emits a chunk that forwards tool_calls in the delta.
+func (p *StreamProcessor) buildToolCall(meta chunkMeta, toolCalls json.RawMessage) []byte {
+	delta := map[string]json.RawMessage{
+		"tool_calls": toolCalls,
+	}
+	if !p.roleSent {
+		delta["role"] = json.RawMessage(`"assistant"`)
+		delta["content"] = json.RawMessage(`null`)
+		p.roleSent = true
+	}
+	p.hasContent = true
+	return assemble(meta, delta, "null", nil)
+}
+
 // cleanUsage keeps only the standard OpenAI usage fields.
 func cleanUsage(ur json.RawMessage) json.RawMessage {
 	var usage map[string]json.RawMessage
@@ -498,7 +582,10 @@ func cleanUsage(ur json.RawMessage) json.RawMessage {
 	keep := make(map[string]json.RawMessage)
 	for _, k := range []string{"prompt_tokens", "completion_tokens", "total_tokens"} {
 		if v, ok := usage[k]; ok {
-			keep[k] = v
+			var n json.Number
+			if err := json.Unmarshal(v, &n); err == nil {
+				keep[k] = v
+			}
 		}
 	}
 	if len(keep) == 0 {
@@ -506,6 +593,27 @@ func cleanUsage(ur json.RawMessage) json.RawMessage {
 	}
 	raw, _ := json.Marshal(keep)
 	return raw
+}
+
+// stripThinkTags removes all <think>...</think> blocks from s, returning only
+// the non-reasoning parts.
+func stripThinkTags(s string) string {
+	var out strings.Builder
+	for {
+		open := strings.Index(s, thinkOpen)
+		if open < 0 {
+			out.WriteString(s)
+			break
+		}
+		out.WriteString(s[:open])
+		rest := s[open+len(thinkOpen):]
+		close := strings.Index(rest, thinkClose)
+		if close < 0 {
+			break
+		}
+		s = rest[close+len(thinkClose):]
+	}
+	return out.String()
 }
 
 // splitThinkFull splits a complete string into (reasoning, answer) by extracting
@@ -518,7 +626,7 @@ func splitThinkFull(s string) (reasoning, answer string) {
 	rest := s[open+len(thinkOpen):]
 	close := strings.Index(rest, thinkClose)
 	if close < 0 {
-		// Unterminated think block: everything after the tag is reasoning.
+		// Unterminated <think>: content after the tag is treated as reasoning.
 		return rest, s[:open]
 	}
 	reasoning = rest[:close]

@@ -87,7 +87,7 @@ func Load() Config {
 		AppVersion:     "2.0.0",
 		UserAgent:      "opencode/1.2.27 ai-sdk/provider-utils/3.0.20 runtime/bun/1.3.10",
 		Listen:         ":10000",
-		Timeout:        300 * time.Second,
+		Timeout:        1800 * time.Second,
 		LogLevel:       "info",
 		LogFormat:      "text",
 		RetryCount:     0,
@@ -135,9 +135,17 @@ func Load() Config {
 			if len(fc.Models) > 0 {
 				c.Models = fc.Models
 			}
+			if len(fc.Credentials) > 0 {
+				c.Credentials = fc.Credentials
+			}
 			if fc.Timeout != "" {
 				if d, err := time.ParseDuration(fc.Timeout); err == nil {
 					c.Timeout = d
+				} else {
+					slog.Warn("config: invalid timeout, using default",
+						slog.String("value", fc.Timeout),
+						slog.String("error", err.Error()),
+					)
 				}
 			}
 			if fc.LogLevel != "" {
@@ -146,7 +154,7 @@ func Load() Config {
 			if fc.LogFormat != "" {
 				c.LogFormat = fc.LogFormat
 			}
-			if fc.RetryCount > 0 {
+			if fc.RetryCount >= 0 {
 				c.RetryCount = fc.RetryCount
 			}
 			if fc.ReasoningMode != "" {
@@ -155,6 +163,11 @@ func Load() Config {
 			if fc.StreamLogEvery != "" {
 				if d, err := time.ParseDuration(fc.StreamLogEvery); err == nil {
 					c.StreamLogEvery = d
+				} else {
+					slog.Warn("config: invalid stream_log_every, using default",
+						slog.String("value", fc.StreamLogEvery),
+						slog.String("error", err.Error()),
+					)
 				}
 			}
 		}
@@ -189,7 +202,7 @@ func Load() Config {
 		c.Listen = v
 	}
 	if v, ok := os.LookupEnv("TELEAGENT_TIMEOUT"); ok {
-		if d, err := time.ParseDuration(v); err == nil {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			c.Timeout = d
 		}
 	}
@@ -213,13 +226,17 @@ func Load() Config {
 		}
 	}
 
-	if len(c.Models) == 0 {
-		modelsStr := getEnv("TELEAGENT_MODELS", "chat-lite,chat-pro,chat-flash")
-		for _, m := range strings.Split(modelsStr, ",") {
+	if v, ok := os.LookupEnv("TELEAGENT_MODELS"); ok {
+		c.Models = nil
+		for _, m := range strings.Split(v, ",") {
 			if m = strings.TrimSpace(m); m != "" {
 				c.Models = append(c.Models, m)
 			}
 		}
+	}
+
+	if len(c.Models) == 0 {
+		c.Models = []string{"chat-lite", "chat-pro", "chat-flash"}
 	}
 
 	if len(c.ModelMeta) == 0 {
@@ -272,7 +289,7 @@ func normalizeReasoningMode(mode string) string {
 func (c Config) SafeSummary() string {
 	tokenHint := ""
 	if c.Token != "" {
-		tokenHint = fmt.Sprintf("%s…%s", c.Token[:min(4, len(c.Token))], c.Token[max(0, len(c.Token)-4):])
+		tokenHint = fmt.Sprintf("%s…", c.Token[:min(4, len(c.Token))])
 	}
 	apiKeyHint := ""
 	if c.APIKey != "" {
@@ -311,12 +328,6 @@ func min(a, b int) int {
 	return b
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
 
 // DefaultModelMeta returns the built-in model metadata discovered from
 // the TeleAgent client's DEFAULT_NEWAPI_MODELS configuration.

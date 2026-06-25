@@ -59,8 +59,8 @@ func (p *UpstreamProxy) BuildRequest(r *http.Request, body []byte, cred config.C
 	requestString := buildRequestString(http.MethodPost, pathWithQuery, timestamp, nonce, p.cfg.AppVersion, bodySHA)
 	signature := hmacSHA256Hex(derivedKey, requestString)
 
-	messageID := firstNonEmpty(r.Header.Get("x-message-id"), "msg_"+mustHexToken(16))
-	sessionID := firstNonEmpty(r.Header.Get("x-session-id"), "ses_"+mustHexToken(16))
+	messageID := "msg_" + mustHexToken(16)
+	sessionID := "ses_" + mustHexToken(16)
 
 	endpoint := *p.baseURL
 	endpoint.Path, endpoint.RawQuery = splitPathAndQuery(joinOriginPath(p.baseURL.Path, pathWithQuery))
@@ -76,7 +76,7 @@ func (p *UpstreamProxy) BuildRequest(r *http.Request, body []byte, cred config.C
 	}
 
 	upstreamReq.Header.Set("Authorization", "Bearer "+p.cfg.UpstreamAPIKey)
-	upstreamReq.Header.Set("Content-Type", firstNonEmpty(r.Header.Get("Content-Type"), "application/json"))
+	upstreamReq.Header.Set("Content-Type", "application/json")
 	upstreamReq.Header.Set("User-Agent", p.cfg.UserAgent)
 	upstreamReq.Header.Set("X-App-Version", p.cfg.AppVersion)
 	upstreamReq.Header.Set("X-SuperAgent-Device-Id", cred.DeviceID)
@@ -185,18 +185,18 @@ func newUUID() (string, error) {
 }
 
 // mustHexToken generates a cryptographically random hex token.
-// If the system PRNG fails it panics — this is preferable to a predictable fallback.
+// If the system PRNG fails it logs an error and returns a zero fallback.
 func mustHexToken(n int) string {
 	buf := make([]byte, n)
 	if _, err := rand.Read(buf); err != nil {
-		panic(fmt.Sprintf("crypto/rand unavailable: %v", err))
+		slog.Error("crypto/rand unavailable, using fallback", slog.String("error", err.Error()))
+		return hex.EncodeToString(make([]byte, n))
 	}
 	return hex.EncodeToString(buf)
 }
 
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
-		value = strings.TrimSpace(value)
 		if value != "" {
 			return value
 		}

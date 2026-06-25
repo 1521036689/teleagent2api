@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"teleagent2api/internal/config"
 	"teleagent2api/internal/handler"
@@ -64,7 +65,7 @@ func main() {
 	server := &http.Server{
 		Addr:         cfg.Listen,
 		Handler:      h,
-		ReadTimeout:  cfg.Timeout / 4,
+		ReadTimeout:  max(cfg.Timeout/4, 1*time.Second),
 		WriteTimeout: cfg.Timeout * 2, // long enough for streaming
 		IdleTimeout:  cfg.Timeout,
 	}
@@ -74,9 +75,9 @@ func main() {
 		slog.String("upstream", cfg.BaseURL),
 	)
 
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		slog.Info("shutting down gracefully...")
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout/4)

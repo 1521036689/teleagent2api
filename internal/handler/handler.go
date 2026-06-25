@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -25,7 +26,7 @@ var credCounter uint64
 func Health() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
 	}
 }
 
@@ -86,14 +87,23 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 
 		// Detect if client requested streaming
 		var reqStruct struct {
-			Stream bool `json:"stream"`
+			Stream bool   `json:"stream"`
+			Model  string `json:"model"`
 		}
 		_ = json.Unmarshal(body, &reqStruct)
 
-		// Total attempts = normal retries + 1 extra attempt for empty response retry
-		maxAttempts := cfg.RetryCount + 2 // +1 for initial, +1 for empty-response retry
+		// maxAttempts = 1 (initial) + retries (configured) + 1 (empty-response safety net)
+		retries := cfg.RetryCount
+		if retries > 10 {
+			retries = 10
+		}
+		maxAttempts := 1 + retries + 1
 
 		// Round-robin credential selection
+		if len(cfg.Credentials) == 0 {
+			writeJSONError(w, "no credentials configured", http.StatusInternalServerError)
+			return
+		}
 		credIdx := atomic.AddUint64(&credCounter, 1) % uint64(len(cfg.Credentials))
 		cred := cfg.Credentials[credIdx]
 
@@ -108,12 +118,15 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 				slog.ErrorContext(r.Context(), "failed to build upstream request",
 					slog.String("error", err.Error()),
 				)
-				http.Error(w, "internal server error", http.StatusInternalServerError)
+				writeJSONError(w, "internal server error", http.StatusInternalServerError)
 				return
 			}
 
 			resp, err := client.Do(upstreamReq)
 			if err != nil {
+				if resp != nil && resp.Body != nil {
+					resp.Body.Close()
+				}
 				if attempt < maxAttempts-1 {
 					continue
 				}
@@ -121,7 +134,7 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 					slog.String("error", err.Error()),
 					slog.Int("attempts", attempt+1),
 				)
-				http.Error(w, "bad gateway", http.StatusBadGateway)
+				writeJSONError(w, "bad gateway", http.StatusBadGateway)
 				return
 			}
 
@@ -134,16 +147,51 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 				slog.Int("upstream_status", resp.StatusCode),
 			)
 
-			// If upstream returned a client error (4xx), pass through — no retry
+			// If upstream returned a client error (4xx), wrap in OpenAI error format
 			if resp.StatusCode >= 400 {
-				copyHeaders(w.Header(), resp.Header)
-				w.WriteHeader(resp.StatusCode)
-				io.Copy(w, resp.Body)
+				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
+				errStr := strings.TrimSpace(string(errBody))
+				if errStr == "" {
+					errStr = http.StatusText(resp.StatusCode)
+				}
+				errJSON, _ := json.Marshal(map[string]any{
+					"error": map[string]any{
+						"message": errStr,
+						"type":    "upstream_error",
+						"code":    resp.StatusCode,
+					},
+				})
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp.StatusCode)
+				w.Write(errJSON)
 				return
 			}
 
 			isStream := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+
+			// --- Fallback: upstream returned non-SSE to a streaming request ---
+			if !isStream && reqStruct.Stream {
+				raw, readErr := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if readErr != nil {
+					slog.ErrorContext(r.Context(), "failed to read upstream fallback response",
+						slog.String("error", readErr.Error()),
+					)
+					writeJSONError(w, "bad gateway", http.StatusBadGateway)
+					return
+				}
+				slog.WarnContext(r.Context(), "upstream returned non-streaming to streaming request, falling back to JSON",
+					slog.Int("body_len", len(raw)),
+				)
+				transformed := adapter.TransformNonStreamingResponse(raw, cfg.ReasoningMode, reqStruct.Model)
+				copyHeaders(w.Header(), resp.Header)
+				setConnectionClose(w, r)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp.StatusCode)
+				w.Write(transformed)
+				return
+			}
 
 			// --- Non-streaming: buffer, check for empty, retry if needed ---
 			if !isStream && !reqStruct.Stream {
@@ -153,7 +201,7 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 					slog.ErrorContext(r.Context(), "failed to read upstream response",
 						slog.String("error", readErr.Error()),
 					)
-					http.Error(w, "bad gateway", http.StatusBadGateway)
+					writeJSONError(w, "bad gateway", http.StatusBadGateway)
 					return
 				}
 
@@ -166,23 +214,25 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 				}
 
 				copyHeaders(w.Header(), resp.Header)
+				setConnectionClose(w, r)
+				transformed := adapter.TransformNonStreamingResponse(raw, cfg.ReasoningMode, reqStruct.Model)
 				w.Header().Del("Content-Length")
-				w.Header().Del("Transfer-Encoding")
+				w.Header().Set("Content-Length", strconv.Itoa(len(transformed)))
 				w.WriteHeader(resp.StatusCode)
-				transformed := adapter.TransformNonStreamingResponse(raw, cfg.ReasoningMode)
 				w.Write(transformed)
 				return
 			}
 
 			// --- Streaming: transform chunks, routing reasoning per mode ---
 			copyHeaders(w.Header(), resp.Header)
+			setConnectionClose(w, r)
 			w.Header().Del("Content-Length")
-			w.Header().Del("Transfer-Encoding")
 			w.WriteHeader(resp.StatusCode)
 
 			proc := adapter.NewStreamProcessor(cfg.ReasoningMode)
+			proc.RequestModel = reqStruct.Model
+			defer resp.Body.Close()
 			hasContent := streamCopy(w, r, resp.Body, proc, cfg)
-			resp.Body.Close()
 
 			// If stream produced zero content chunks, we cannot retry because the
 			// response headers were already committed. Log for diagnostics.
@@ -196,7 +246,7 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 		}
 
 		// Should not reach here, but just in case
-		http.Error(w, "bad gateway", http.StatusBadGateway)
+		writeJSONError(w, "bad gateway", http.StatusBadGateway)
 	}
 }
 
@@ -205,10 +255,16 @@ func ChatCompletions(up *proxy.UpstreamProxy, client *http.Client, cfg config.Co
 // and flushes to the client. It logs periodic progress for diagnostics and
 // returns whether any content/reasoning was emitted.
 func streamCopy(w http.ResponseWriter, r *http.Request, body io.Reader, proc *adapter.StreamProcessor, cfg config.Config) bool {
-	flusher, _ := w.(http.Flusher)
-	reader := bufio.NewReader(body)
 	ctx := r.Context()
 	reqID := middleware.GetRequestID(ctx)
+
+	flusher, flusherOK := w.(http.Flusher)
+	if !flusherOK {
+		slog.WarnContext(ctx, "streamCopy: ResponseWriter does not support Flusher",
+			slog.String("request_id", reqID),
+		)
+	}
+	reader := bufio.NewReader(body)
 
 	start := time.Now()
 	lastLog := start
@@ -308,12 +364,25 @@ func transformSSELineMulti(line []byte, proc *adapter.StreamProcessor) [][]byte 
 	if s == "" {
 		return nil
 	}
-	if !strings.HasPrefix(s, "data: ") {
-		return [][]byte{line}
+	// Accept both "data: " (standard) and "data:" (no space)
+	dataPrefix := "data:"
+	prefixedWithSpace := "data: "
+	if !strings.HasPrefix(s, prefixedWithSpace) && !strings.HasPrefix(s, dataPrefix) {
+		return nil
 	}
-	payload := strings.TrimPrefix(s, "data: ")
+	payload := s[len(dataPrefix):]
+	payload = strings.TrimSpace(payload)
 	if payload == "[DONE]" {
-		return [][]byte{[]byte("data: [DONE]\n\n")}
+		var res [][]byte
+		for _, pld := range proc.Flush() {
+			buf := make([]byte, 0, len(pld)+8)
+			buf = append(buf, "data: "...)
+			buf = append(buf, pld...)
+			buf = append(buf, '\n', '\n')
+			res = append(res, buf)
+		}
+		res = append(res, []byte("data: [DONE]\n\n"))
+		return res
 	}
 	outs := proc.ProcessChunk([]byte(payload))
 	if len(outs) == 0 {
@@ -342,6 +411,7 @@ var proxyResponseHeaderBlacklist = map[string]struct{}{
 	"transfer-encoding":   {},
 	"upgrade":             {},
 	"set-cookie":          {},
+	"set-cookie2":         {},
 	"x-frame-options":     {},
 	"x-message-id":        {},
 	"x-session-id":        {},
@@ -357,8 +427,26 @@ func copyHeaders(dst, src http.Header) {
 			continue
 		}
 		for _, value := range values {
-			dst.Add(key, value)
+			dst.Set(key, value)
 		}
 	}
-	dst.Set("Connection", "close")
+}
+
+func setConnectionClose(w http.ResponseWriter, r *http.Request) {
+	if r.ProtoMajor < 2 {
+		w.Header().Set("Connection", "close")
+	}
+}
+
+// writeJSONError writes an OpenAI-compatible JSON error response.
+func writeJSONError(w http.ResponseWriter, message string, code int) {
+	errBody, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": message,
+			"type":    "server_error",
+		},
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write(errBody)
 }

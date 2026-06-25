@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -73,7 +75,7 @@ func MaxBodySize(limit int64) func(http.Handler) http.Handler {
 func newRequestID() string {
 	buf := make([]byte, 12)
 	if _, err := rand.Read(buf); err != nil {
-		return hex.EncodeToString([]byte(time.Now().Format("060102150405")))
+		return fmt.Sprintf("%x%x", os.Getpid(), time.Now().UnixNano())
 	}
 	return hex.EncodeToString(buf)
 }
@@ -81,19 +83,30 @@ func newRequestID() string {
 // statusWriter captures response status and bytes written.
 type statusWriter struct {
 	http.ResponseWriter
-	status int
-	bytes  int
+	status      int
+	bytes       int
+	wroteHeader bool
 }
 
 func (w *statusWriter) WriteHeader(code int) {
+	if w.wroteHeader {
+		return
+	}
 	w.status = code
 	w.ResponseWriter.WriteHeader(code)
+	w.wroteHeader = true
 }
 
 func (w *statusWriter) Write(b []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(b)
 	w.bytes += n
 	return n, err
+}
+
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func (w *statusWriter) Unwrap() http.ResponseWriter {

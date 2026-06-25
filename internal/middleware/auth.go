@@ -20,11 +20,14 @@ func Auth(expectedKey string) func(http.Handler) http.Handler {
 			}
 
 			authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
-			got := []byte(authHeader)
-			want := []byte("Bearer " + expectedKey)
-			if subtle.ConstantTimeCompare(got, want) == 1 {
-				next.ServeHTTP(w, r)
-				return
+			parts := strings.SplitN(authHeader, " ", 2)
+			if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+				got := []byte(parts[1])
+				want := []byte(expectedKey)
+				if subtle.ConstantTimeCompare(got, want) == 1 {
+					next.ServeHTTP(w, r)
+					return
+				}
 			}
 
 			slog.WarnContext(r.Context(), "auth: rejected",
@@ -32,7 +35,7 @@ func Auth(expectedKey string) func(http.Handler) http.Handler {
 				slog.String("path", r.URL.Path),
 			)
 
-			w.Header().Set("WWW-Authenticate", "Bearer")
+			w.Header().Set("WWW-Authenticate", `Bearer realm="teleagent2api"`)
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(map[string]string{"error": "invalid api key"})
